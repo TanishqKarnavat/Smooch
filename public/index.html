@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#fb4f89" />
+  <title>HeartSync — a little closer, one choice at a time</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header><a class="brand" href="/">Heart<span>Sync</span><i>♥</i></a><p>made for the two of you</p></header>
+    <section id="home" class="view hero">
+      <div class="eyebrow">A private little game for couples</div>
+      <h1>Find the tiny things<br><em>you have in common.</em></h1>
+      <p class="lede">Pick a deck, choose privately, then reveal together. No account, no feeds, no pressure.</p>
+      <div class="deck-grid" id="deck-grid"></div>
+      <div class="mode-grid">
+        <button class="mode-card" id="shared-start"><span>☕</span><b>On one screen</b><small>Pass the phone and talk it out</small></button>
+        <button class="mode-card" id="online-start"><span>✦</span><b>From anywhere</b><small>Create a private two-person room</small></button>
+      </div>
+      <p class="privacy">Rooms disappear after 6 hours. We do not keep your answers.</p>
+    </section>
+
+    <section id="setup" class="view panel hidden" aria-live="polite">
+      <button class="back" data-home>← Back</button>
+      <div class="eyebrow" id="setup-mode">Together, right here</div>
+      <h2>What should we call you?</h2>
+      <label>Your name <input id="name" maxlength="24" placeholder="e.g. Mia" autocomplete="name" /></label>
+      <label class="avatar-label">Choose your charm <span id="avatars"></span></label>
+      <button class="primary" id="setup-submit">Continue <span>→</span></button>
+      <p class="form-note" id="setup-note"></p>
+    </section>
+
+    <section id="game" class="view hidden" aria-live="polite">
+      <div class="game-top"><button class="back" data-home>× End game</button><span id="room-badge"></span><span id="progress"></span></div>
+      <div class="players" id="players"></div>
+      <div class="question-card"><div class="category" id="category"></div><h2 id="prompt"></h2><p id="instruction">Choose what feels most like you.</p>
+        <div class="choices" id="choices"></div><div class="waiting hidden" id="waiting">Your answer is sealed <span></span></div>
+        <div class="reveal hidden" id="reveal"></div>
+      </div>
+      <button class="primary hidden" id="next">Next little discovery <span>→</span></button>
+    </section>
+  </main>
+  <div class="toast hidden" id="toast"></div>
+  <script src="/socket.io/socket.io.js"></script><script src="/app.js"></script>
+</body>
+</html>
