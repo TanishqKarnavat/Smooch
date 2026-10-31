@@ -20,17 +20,35 @@ function createRedisClient(url) {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
     connectTimeout: 15000,
-    keepAlive: 10000,
-    family: process.env.VERCEL ? 6 : undefined
+    keepAlive: 10000
   });
   client.on('error', (error) => console.error('Redis connection error:', error.message));
   return client;
+}
+
+// Production must never silently fall back to in-memory rooms: a second
+// player would land on a different Function instance and could never join.
+// Instead, every operation fails with an actionable message that the UI
+// surfaces as a toast, and the reason is logged server-side.
+class UnconfiguredRoomStore {
+  constructor(reason) { this.reason = reason; }
+  async create() { throw new Error(this.reason); }
+  async get() { return null; }
+  async join() { return { ok: false, error: this.reason }; }
+  async resume() { return null; }
+  async submit() { return { ok: false, error: this.reason }; }
+  async next() { return { ok: false, error: this.reason }; }
 }
 
 function resolveStore(options) {
   if (options.store) return options.store;
   const url = redisUrl(options);
   if (url) return new RedisRoomStore(options.redis || createRedisClient(url));
+  if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+    const reason = 'Multiplayer storage is not configured on this server (UPSTASH_REDIS_URL is missing).';
+    console.error(`[smooch] ${reason} Set UPSTASH_REDIS_URL in the deployment environment.`);
+    return new UnconfiguredRoomStore(reason);
+  }
   return createRoomStore({ localRooms: rooms });
 }
 
@@ -38,7 +56,11 @@ function createSocketServer(server, options = {}) {
   const store = resolveStore(options);
   const io = new Server(server, {
     cors: { origin: true },
-    path: options.path || '/api/socket-io/socket.io',
+    // Must stay equal to the exact path Vercel routes to api/socket-io.js.
+    // Vercel does not route subpaths (e.g. /api/socket-io/socket.io/...) to
+    // the Function, so the Socket.IO path deliberately has no subpath, and
+    // the client bundle is served statically from public/vendor/.
+    path: options.path || '/api/socket-io',
     transports: ['websocket']
   });
   const broadcast = options.broadcast || ((roomCode, event, payload) => io.to(roomCode).emit(event, payload));
@@ -151,4 +173,4 @@ if (require.main === module) {
   server.listen(process.env.PORT || 3000, () => console.log('HeartSync is ready at http://localhost:3000'));
 }
 
-module.exports = { buildServer, createSocketServer, rooms, MemoryRoomStore, cleanName, publicRoom };
+module.exports = { buildServer, createSocketServer, rooms, MemoryRoomStore, UnconfiguredRoomStore, cleanName, publicRoom };

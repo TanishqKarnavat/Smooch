@@ -1,12 +1,16 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { io: Client } = require('socket.io-client');
 const Redis = require('ioredis');
-const { buildServer, MemoryRoomStore } = require('../server');
+const { buildServer, MemoryRoomStore, UnconfiguredRoomStore } = require('../server');
 const { RedisRoomStore, tokenHash } = require('../room-store');
 const vercelSocketFunction = require('../api/socket-io');
 
-const socketOptions = { path: '/api/socket-io/socket.io', transports: ['websocket'] };
+// Mirrors public/app.js: WebSocket-only transport against the exact path
+// Vercel routes to api/socket-io.js (subpaths are NOT routed by Vercel).
+const socketOptions = { path: '/api/socket-io', transports: ['websocket'] };
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const once = (socket, event) => new Promise((resolve) => socket.once(event, resolve));
 const emit = (socket, event, payload) => new Promise((resolve) => socket.emit(event, payload, resolve));
@@ -31,22 +35,77 @@ test('Vercel Socket.IO API Function exports an unstarted HTTP server', () => {
   assert.equal(vercelSocketFunction.listening, false);
 });
 
+test('vendored Socket.IO browser client matches the installed server version', () => {
+  const bundle = fs.readFileSync(path.join(__dirname, '..', 'public', 'vendor', 'socket.io.min.js'), 'utf8');
+  const version = require('socket.io/package.json').version;
+  assert.ok(bundle.includes(`Socket.IO v${version}`), `public/vendor/socket.io.min.js is stale (server is v${version})`);
+  assert.equal(typeof globalThis.io, 'undefined'); // sanity: bundle must not be loaded here
+});
+
+test('production without an Upstash Redis URL degrades clearly, never to memory', async () => {
+  const previous = process.env.VERCEL;
+  process.env.VERCEL = '1';
+  const instance = buildServer();
+  try {
+    assert.ok(instance.store instanceof UnconfiguredRoomStore, 'must not use the in-memory store in production');
+    await assert.rejects(() => instance.store.create({ name: 'A' }), /UPSTASH_REDIS_URL is missing/);
+  } finally {
+    instance.io.close();
+    await new Promise((resolve) => instance.server.close(resolve));
+    if (previous === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = previous;
+  }
+});
+
+test('Vercel Function export answers plain HTTP and serves a full socket game', async (t) => {
+  await new Promise((resolve) => vercelSocketFunction.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${vercelSocketFunction.address().port}`;
+
+  // Non-upgrade requests must get a prompt JSON answer, not a platform timeout.
+  const probe = await fetch(`${url}/`);
+  assert.equal(probe.status, 404);
+  assert.equal((await probe.json()).ok, false);
+
+  const a = Client(url, socketOptions);
+  const b = Client(url, socketOptions);
+  // Teardown order matters: close WebSocket clients first (Node's
+  // closeAllConnections does not destroy upgraded connections), then idle
+  // HTTP sockets, and only then wait for the server to close.
+  t.after(async () => {
+    a.close(); b.close();
+    await wait(25);
+    vercelSocketFunction.closeAllConnections?.();
+    await new Promise((resolve) => vercelSocketFunction.close(resolve));
+  });
+  await Promise.all([once(a, 'connect'), once(b, 'connect')]);
+
+  const made = await emit(a, 'room:create', { name: 'A', deck: 'cozy' });
+  assert.equal(made.ok, true);
+  assert.match(made.room.code, /^[0-9A-F]{4}-[0-9A-F]{4}$/);
+  assert.ok(made.resumeToken.length > 30);
+
+  const joined = await emit(b, 'room:join', { code: made.room.code, name: 'B' });
+  assert.equal(joined.ok, true);
+  assert.equal(joined.room.players.length, 2);
+
+  const revealA = once(a, 'answer:reveal');
+  const first = await emit(a, 'answer:submit', { choice: 1, expectedRound: 0 });
+  assert.equal(first.waiting, true);
+  const second = await emit(b, 'answer:submit', { choice: 1, expectedRound: 0 });
+  assert.equal(second.revealed, true);
+  const event = await revealA;
+  assert.equal(event.match, true);
+  assert.equal(event.room.matchScore, 1);
+
+  const next = await emit(a, 'round:next', { expectedRound: 0 });
+  assert.equal(next.advanced, true);
+});
+
 test('memory fallback expires rooms without a later room access', async () => {
   const store = new MemoryRoomStore(new Map(), 10);
   const created = await store.create({ name: 'A' });
   await wait(25);
   assert.equal(store.rooms.has(created.room.code), false);
-});
-
-test('production startup fails clearly without an Upstash Redis URL', () => {
-  const previous = process.env.VERCEL;
-  process.env.VERCEL = '1';
-  try {
-    assert.throws(() => buildServer(), /UPSTASH_REDIS_URL is required/);
-  } finally {
-    if (previous === undefined) delete process.env.VERCEL;
-    else process.env.VERCEL = previous;
-  }
 });
 
 test('Redis integration: room lifecycle mutations are atomic', { skip: !testRedisUrl }, async (t) => {
