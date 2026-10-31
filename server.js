@@ -1,111 +1,149 @@
 const path = require('node:path');
 const http = require('node:http');
-const crypto = require('node:crypto');
 const express = require('express');
+const Redis = require('ioredis');
 const { Server } = require('socket.io');
+const { createAdapter } = require('@socket.io/redis-adapter');
+const { MemoryRoomStore, RedisRoomStore, createRoomStore, publicRoom, cleanName } = require('./room-store');
 
-const ROOM_TTL_MS = 1000 * 60 * 60 * 6;
-const MAX_PLAYERS = 2;
+// Local development deliberately uses this map only when no Redis URL is set.
 const rooms = new Map();
 
-function code() {
-  return crypto.randomBytes(4).toString('hex').toUpperCase().match(/.{1,4}/g).join('-');
+function redisUrl(options) {
+  const url = options.redisUrl || process.env.UPSTASH_REDIS_URL;
+  const trimmed = url && String(url).trim();
+  return trimmed || undefined;
 }
 
-function publicRoom(room) {
-  return {
-    code: room.code,
-    deck: room.deck,
-    round: room.round,
-    playerCount: room.players.size,
-    players: [...room.players.values()].map(({ id, name, avatar }) => ({ id, name, avatar })),
-    submitted: [...room.answers.keys()],
-    status: room.answers.size === MAX_PLAYERS ? 'revealed' : 'playing'
-  };
+function createRedisClient(url) {
+  const client = new Redis(url, {
+    maxRetriesPerRequest: null,
+    enableReadyCheck: false,
+    connectTimeout: 15000,
+    keepAlive: 10000,
+    family: process.env.VERCEL ? 6 : undefined
+  });
+  client.on('error', (error) => console.error('Redis connection error:', error.message));
+  return client;
 }
 
-function createRoom({ name, avatar, deck }) {
-  let roomCode = code();
-  while (rooms.has(roomCode)) roomCode = code();
-  const player = { id: crypto.randomUUID(), name: cleanName(name), avatar: avatar || '💗' };
-  const room = { code: roomCode, deck: deck || 'spark', round: 0, players: new Map([[player.id, player]]), answers: new Map(), createdAt: Date.now() };
-  rooms.set(roomCode, room);
-  return { room, player };
+function resolveStore(options) {
+  if (options.store) return options.store;
+  const url = redisUrl(options);
+  if (url) return new RedisRoomStore(options.redis || createRedisClient(url));
+  return createRoomStore({ localRooms: rooms });
 }
 
-function cleanName(value) {
-  return String(value || 'Partner').trim().slice(0, 24) || 'Partner';
-}
+function createSocketServer(server, options = {}) {
+  const store = resolveStore(options);
+  const io = new Server(server, {
+    cors: { origin: true },
+    path: options.path || '/api/socket-io/socket.io',
+    transports: ['websocket']
+  });
+  const broadcast = options.broadcast || ((roomCode, event, payload) => io.to(roomCode).emit(event, payload));
 
-function findRoom(roomCode) {
-  const room = rooms.get(String(roomCode || '').toUpperCase());
-  if (!room || Date.now() - room.createdAt > ROOM_TTL_MS) {
-    if (room) rooms.delete(room.code);
-    return null;
+  const url = redisUrl(options);
+  if (url && !options.disableRedisAdapter) {
+    const pubClient = options.pubClient || createRedisClient(url);
+    const subClient = options.subClient || pubClient.duplicate();
+    if (!options.subClient) subClient.on('error', (error) => console.error('Redis connection error:', error.message));
+    io.adapter(createAdapter(pubClient, subClient));
   }
-  return room;
-}
 
-function attachRealtime(io) {
+  const bindPlayer = (socket, room, player) => {
+    socket.data.playerId = player.id;
+    socket.data.roomCode = room.code;
+    socket.join(room.code);
+  };
+  const currentPlayer = async (socket) => {
+    const room = await store.get(socket.data.roomCode);
+    const player = room?.players.find((candidate) => candidate.id === socket.data.playerId);
+    return player ? { room, player } : null;
+  };
+  const replyError = (done, error) => done?.({ ok: false, error: error.message || 'Something went wrong. Please try again.' });
+
   io.on('connection', (socket) => {
-    socket.on('room:create', (payload, done) => {
-      const { room, player } = createRoom(payload || {});
-      socket.join(room.code);
-      socket.data.playerId = player.id;
-      socket.data.roomCode = room.code;
-      done?.({ ok: true, room: publicRoom(room), player });
+    const resumeToken = socket.handshake.auth?.resumeToken;
+    if (resumeToken) {
+      void store.resume(resumeToken).then((session) => {
+        if (!session) return socket.emit('room:expired');
+        bindPlayer(socket, session.room, session.player);
+        socket.emit('room:sync', { room: publicRoom(session.room), player: session.player });
+      }).catch((error) => socket.emit('room:error', { error: error.message }));
+    }
+
+    socket.on('room:create', async (payload, done) => {
+      try {
+        const { room, player, resumeToken: token } = await store.create(payload || {});
+        bindPlayer(socket, room, player);
+        done?.({ ok: true, room: publicRoom(room), player, resumeToken: token });
+      } catch (error) { replyError(done, error); }
     });
 
-    socket.on('room:join', (payload, done) => {
-      const room = findRoom(payload?.code);
-      if (!room) return done?.({ ok: false, error: 'That room has expired or does not exist.' });
-      if (room.players.size >= MAX_PLAYERS) return done?.({ ok: false, error: 'This room already has two players.' });
-      const player = { id: crypto.randomUUID(), name: cleanName(payload?.name), avatar: payload?.avatar || '💜' };
-      room.players.set(player.id, player);
-      socket.join(room.code);
-      socket.data.playerId = player.id;
-      socket.data.roomCode = room.code;
-      const state = publicRoom(room);
-      io.to(room.code).emit('room:update', state);
-      done?.({ ok: true, room: state, player });
+    socket.on('room:join', async (payload, done) => {
+      try {
+        const result = await store.join(payload || {});
+        if (!result.ok) return done?.(result);
+        bindPlayer(socket, result.room, result.player);
+        const state = publicRoom(result.room);
+        broadcast(result.room.code, 'room:update', state);
+        done?.({ ok: true, room: state, player: result.player, resumeToken: result.resumeToken });
+      } catch (error) { replyError(done, error); }
     });
 
-    socket.on('answer:submit', (payload, done) => {
-      const room = findRoom(socket.data.roomCode);
-      if (!room || !room.players.has(socket.data.playerId)) return done?.({ ok: false, error: 'Your room has expired.' });
-      if (![0, 1].includes(payload?.choice)) return done?.({ ok: false, error: 'Choose one of the two options.' });
-      room.answers.set(socket.data.playerId, payload.choice);
-      if (room.answers.size < MAX_PLAYERS) {
-        socket.to(room.code).emit('room:update', publicRoom(room));
-        return done?.({ ok: true, waiting: true });
-      }
-      const answers = [...room.answers.entries()].map(([playerId, choice]) => ({ playerId, choice }));
-      const match = answers[0].choice === answers[1].choice;
-      io.to(room.code).emit('answer:reveal', { answers, match, room: publicRoom(room) });
-      done?.({ ok: true, waiting: false });
+    socket.on('room:sync', async (_, done) => {
+      try {
+        const session = await currentPlayer(socket);
+        if (!session) return done?.({ ok: false, error: 'Your room has expired.' });
+        const state = { room: publicRoom(session.room), player: session.player };
+        socket.emit('room:sync', state);
+        done?.({ ok: true, ...state });
+      } catch (error) { replyError(done, error); }
     });
 
-    socket.on('round:next', (_, done) => {
-      const room = findRoom(socket.data.roomCode);
-      if (!room || !room.players.has(socket.data.playerId)) return done?.({ ok: false, error: 'Your room has expired.' });
-      room.round += 1;
-      room.answers.clear();
-      const state = publicRoom(room);
-      io.to(room.code).emit('round:next', state);
-      done?.({ ok: true, room: state });
+    socket.on('answer:submit', async (payload, done) => {
+      try {
+        const result = await store.submit({
+          code: socket.data.roomCode, playerId: socket.data.playerId,
+          choice: payload?.choice, expectedRound: payload?.expectedRound
+        });
+        if (!result.ok) return done?.({ ...result, room: result.room && publicRoom(result.room) });
+        const state = publicRoom(result.room);
+        if (result.revealed) {
+          const answers = Object.entries(result.answers).map(([playerId, choice]) => ({ playerId, choice }));
+          broadcast(result.room.code, 'answer:reveal', { answers, match: result.match, room: state });
+        } else if (!result.duplicate) {
+          socket.to(result.room.code).emit('room:update', state);
+        }
+        done?.({ ...result, room: state });
+      } catch (error) { replyError(done, error); }
+    });
+
+    socket.on('round:next', async (payload, done) => {
+      try {
+        const result = await store.next({
+          code: socket.data.roomCode, playerId: socket.data.playerId, expectedRound: payload?.expectedRound
+        });
+        if (!result.ok) return done?.({ ...result, room: result.room && publicRoom(result.room) });
+        const state = publicRoom(result.room);
+        if (result.advanced) broadcast(result.room.code, 'round:next', state);
+        done?.({ ...result, room: state });
+      } catch (error) { replyError(done, error); }
     });
   });
+
+  return { io, store };
 }
 
-function buildServer() {
+function buildServer(options = {}) {
   const app = express();
   app.use(express.static(path.join(__dirname, 'public')));
-  app.get('/health', (_, res) => res.json({ ok: true, rooms: rooms.size }));
+  app.get('/health', (_, res) => res.json({ ok: true, storage: redisUrl(options) ? 'redis' : 'memory' }));
   app.get('*splat', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
   const server = http.createServer(app);
-  const io = new Server(server, { cors: { origin: true } });
-  attachRealtime(io);
-  return { app, server, io };
+  const realtime = createSocketServer(server, options);
+  return { app, server, ...realtime };
 }
 
 if (require.main === module) {
@@ -113,4 +151,4 @@ if (require.main === module) {
   server.listen(process.env.PORT || 3000, () => console.log('HeartSync is ready at http://localhost:3000'));
 }
 
-module.exports = { buildServer, rooms, createRoom, findRoom, publicRoom, cleanName };
+module.exports = { buildServer, createSocketServer, rooms, MemoryRoomStore, cleanName, publicRoom };
